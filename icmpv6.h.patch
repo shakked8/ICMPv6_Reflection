@@ -1,0 +1,17 @@
+--- linux-original2/include/uapi/linux/icmpv6.h	2024-05-30 10:49:53.000000000 +0300
++++ linux-original/include/uapi/linux/icmpv6.h	2026-02-19 22:17:52.475960151 +0200
+@@ -174,5 +174,14 @@
+ 
+ #define MLD2_ALL_MCR_INIT { { { 0xff,0x02,0,0,0,0,0,0,0,0,0,0,0,0,0,0x16 } } }
+ 
++struct icmp_ext_obj_hdr {
++    __be16 length;
++    __u8   class_num;
++    __u8   c_type;
++};
++//corrently using arbitrary num because TBD1 has not yet been officially assigned by IANA. todo: change to official num 
++#define ICMP_EXT_OBJ_CLASS_REFLECT_ALL  0xFA 
++#define ICMP_EXT_OBJ_CTYPE_REQUEST      0
++#define ICMP_EXT_OBJ_CTYPE_REPLY        1
+ 
+ #endif /* _UAPI_LINUX_ICMPV6_H */
