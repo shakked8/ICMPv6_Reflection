@@ -1,0 +1,207 @@
+--- linux-original2/include/uapi/linux/icmpv6.h	2024-05-30 10:49:53.000000000 +0300
++++ linux-original/include/uapi/linux/icmpv6.h	2026-02-19 22:17:52.475960151 +0200
+@@ -174,5 +174,14 @@
+ 
+ #define MLD2_ALL_MCR_INIT { { { 0xff,0x02,0,0,0,0,0,0,0,0,0,0,0,0,0,0x16 } } }
+ 
++struct icmp_ext_obj_hdr {
++    __be16 length;
++    __u8   class_num;
++    __u8   c_type;
++};
++//corrently using arbitrary num because TBD1 has not yet been officially assigned by IANA. todo: change to official num 
++#define ICMP_EXT_OBJ_CLASS_REFLECT_ALL  0xFA 
++#define ICMP_EXT_OBJ_CTYPE_REQUEST      0
++#define ICMP_EXT_OBJ_CTYPE_REPLY        1
+ 
+ #endif /* _UAPI_LINUX_ICMPV6_H */
+--- linux-original2/net/ipv6/icmp.c	2024-05-30 10:49:53.000000000 +0300
++++ linux-original/net/ipv6/icmp.c	2026-02-19 22:17:54.499960144 +0200
+@@ -726,6 +726,11 @@
+ 	SKB_DR(reason);
+ 	bool acast;
+ 	u8 type;
++	u32 len;
++	
++	/* Reflection and Peeking variables */
++	struct sk_buff *reflect_skb = NULL;
++	bool is_reflection_packet = false;
+ 
+ 	if (ipv6_addr_is_multicast(&ipv6_hdr(skb)->daddr) &&
+ 	    net->ipv6.sysctl.icmpv6_echo_ignore_multicast)
+@@ -776,17 +781,18 @@
+ 
+ 	if (ip6_dst_lookup(net, sk, &dst, &fl6))
+ 		goto out;
++	
+ 	dst = xfrm_lookup(net, dst, flowi6_to_flowi(&fl6), sk, 0);
+ 	if (IS_ERR(dst))
+ 		goto out;
+ 
+-	/* Check the ratelimit */
+ 	if ((!(skb->dev->flags & IFF_LOOPBACK) && !icmpv6_global_allow(net, ICMPV6_ECHO_REPLY)) ||
+ 	    !icmpv6_xrlim_allow(sk, ICMPV6_ECHO_REPLY, &fl6))
+ 		goto out_dst_release;
+ 
+ 	idev = __in6_dev_get(skb->dev);
+ 
++	/* Default: Original packet is the source */
+ 	msg.skb = skb;
+ 	msg.offset = 0;
+ 	msg.type = type;
+@@ -796,21 +802,96 @@
+ 	ipc6.tclass = ipv6_get_dsfield(ipv6_hdr(skb));
+ 	ipc6.sockc.mark = mark;
+ 
+-	if (icmph->icmp6_type == ICMPV6_EXT_ECHO_REQUEST)
+-		if (!icmp_build_probe(skb, (struct icmphdr *)&tmp_hdr))
+-			goto out_dst_release;
++	/* --- Reflection Detection Logic --- */
++	if (icmph->icmp6_type == ICMPV6_EXT_ECHO_REQUEST) {
++		size_t ext_len = sizeof(struct icmp6hdr) + 
++				 sizeof(struct icmp_ext_hdr) + 
++				 sizeof(struct icmp_ext_obj_hdr);
++
++		/* 1. Peeking Phase */
++		if (pskb_may_pull(skb, ext_len)) {
++			struct icmp_ext_hdr *peek_ext_hdr;
++			struct icmp_ext_obj_hdr *peek_obj_hdr;
++
++			/* Re-fetch icmph as pskb_may_pull might have changed skb->data */
++			icmph = icmp6_hdr(skb);
++			peek_ext_hdr = (struct icmp_ext_hdr *)(icmph + 1);
++			peek_obj_hdr = (struct icmp_ext_obj_hdr *)(peek_ext_hdr + 1);
++
++			if (peek_ext_hdr->version == 2 && peek_obj_hdr->class_num == 0xFA)
++				is_reflection_packet = true;
++		}
++
++		/* 2. Run standard PROBE logic if not our Reflection packet */
++		if (!is_reflection_packet) {
++			if (!icmp_build_probe(skb, (struct icmphdr *)&tmp_hdr))
++				goto out_dst_release;
++		}
++	}
++
++	/* Calculate default payload length */
++	len = skb->len - msg.offset;
++	{
++		unsigned int max_len = IPV6_MIN_MTU - sizeof(struct ipv6hdr) - sizeof(struct icmp6hdr);
++		if (len > max_len)
++			len = max_len;
++	}
+ 
++	/* --- Reflection Modification Logic --- */
++	if (is_reflection_packet) {
++		int full_original_len = skb_tail_pointer(skb) - skb_network_header(skb);
++		
++		reflect_skb = skb_copy(skb, GFP_ATOMIC);
++		if (reflect_skb) {
++			struct icmp6hdr *new_icmph;
++			struct icmp_ext_hdr *new_ext_hdr;
++			struct icmp_ext_obj_hdr *new_obj_hdr;
++			unsigned char *payload_ptr;
++			int available_space, copy_len;
++
++			msg.skb = reflect_skb;
++			msg.offset = 0;
++			
++			new_icmph = icmp6_hdr(reflect_skb);
++			new_ext_hdr = (struct icmp_ext_hdr *)(new_icmph + 1);
++			new_obj_hdr = (struct icmp_ext_obj_hdr *)(new_ext_hdr + 1);
++			payload_ptr = (unsigned char *)(new_obj_hdr + 1);
++
++			available_space = ntohs(new_obj_hdr->length) - sizeof(struct icmp_ext_obj_hdr);
++			copy_len = min_t(int, full_original_len, available_space);
++
++			/* 1. Copy original packet into payload */
++			memcpy(payload_ptr, skb_network_header(skb), copy_len);
++
++			/* 2. Set ACTIVE flag and adjust length */
++			new_obj_hdr->c_type = 1;
++			new_obj_hdr->length = htons(sizeof(struct icmp_ext_obj_hdr) + copy_len);
++
++			/* 3. Reset Checksum and change type */
++			new_icmph->icmp6_cksum = 0;
++			new_icmph->icmp6_type = ICMPV6_EXT_ECHO_REPLY;
++		} else {
++			pr_debug("Reflection: Memory allocation failed\n");
++		}
++	}
++
++	/* Send reply */
+ 	if (ip6_append_data(sk, icmpv6_getfrag, &msg,
+-			    skb->len + sizeof(struct icmp6hdr),
++			    len + sizeof(struct icmp6hdr),
+ 			    sizeof(struct icmp6hdr), &ipc6, &fl6,
+ 			    (struct rt6_info *)dst, MSG_DONTWAIT)) {
+ 		__ICMP6_INC_STATS(net, idev, ICMP6_MIB_OUTERRORS);
+ 		ip6_flush_pending_frames(sk);
+ 	} else {
+ 		icmpv6_push_pending_frames(sk, &fl6, &tmp_hdr,
+-					   skb->len + sizeof(struct icmp6hdr));
++					   len + sizeof(struct icmp6hdr));
+ 		reason = SKB_CONSUMED;
+ 	}
++
++	/* Cleanup */
++	if (reflect_skb)
++		consume_skb(reflect_skb);
++
+ out_dst_release:
+ 	dst_release(dst);
+ out:
+@@ -874,9 +955,7 @@
+ 	return reason;
+ }
+ 
+-/*
+- *	Handle icmp messages
+- */
++
+ 
+ static int icmpv6_rcv(struct sk_buff *skb)
+ {
+@@ -953,16 +1032,10 @@
+ 		break;
+ 
+ 	case ICMPV6_PKT_TOOBIG:
+-		/* BUGGG_FUTURE: if packet contains rthdr, we cannot update
+-		   standard destination cache. Seems, only "advanced"
+-		   destination cache will allow to solve this problem
+-		   --ANK (980726)
+-		 */
+ 		if (!pskb_may_pull(skb, sizeof(struct ipv6hdr)))
+ 			goto discard_it;
+ 		hdr = icmp6_hdr(skb);
+ 
+-		/* to notify */
+ 		fallthrough;
+ 	case ICMPV6_DEST_UNREACH:
+ 	case ICMPV6_TIME_EXCEED:
+@@ -998,25 +1071,17 @@
+ 		break;
+ 
+ 	default:
+-		/* informational */
+ 		if (type & ICMPV6_INFOMSG_MASK)
+ 			break;
+ 
+ 		net_dbg_ratelimited("icmpv6: msg of unknown type [%pI6c > %pI6c]\n",
+ 				    saddr, daddr);
+ 
+-		/*
+-		 * error of unknown type.
+-		 * must pass to upper level
+-		 */
+ 
+ 		reason = icmpv6_notify(skb, type, hdr->icmp6_code,
+ 				       hdr->icmp6_mtu);
+ 	}
+ 
+-	/* until the v6 path can be better sorted assume failure and
+-	 * preserve the status quo behaviour for the rest of the paths to here
+-	 */
+ 	if (reason)
+ 		kfree_skb_reason(skb, reason);
+ 	else
