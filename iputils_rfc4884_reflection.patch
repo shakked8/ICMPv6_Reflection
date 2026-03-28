@@ -1,0 +1,436 @@
+From 45d10531b13b6b63393f5245eab13509ce229ffd Mon Sep 17 00:00:00 2001
+From: Shakked Zucker <shakkedz@campus.technion.ac.il>
+Date: Sun, 22 Jun 2025 07:30:38 +0530
+Subject: [PATCH] ping: add -z for RFC 4884 Reflect All and -x for hex dump
+
+---
+ meson.build         |   2 +-
+ ping/ping.c         |   9 ++-
+ ping/ping.h         |   5 ++
+ ping/ping6_common.c | 107 +++++++++++++++++++++---------
+ ping/ping_common.c  | 158 +++++++++++++++++++++++++++++++++-----------
+ 5 files changed, 209 insertions(+), 72 deletions(-)
+
+diff --git a/meson.build b/meson.build
+index b81071d..6aaa181 100644
+--- a/meson.build
++++ b/meson.build
+@@ -143,7 +143,7 @@ endif
+ foreach h : [
+ 	'error.h',
+ ]
+-	if cc.has_header(h)
++	if cc.has_header(h) and cc.has_function('error')
+ 		conf.set('HAVE_' + h.to_upper().underscorify(), 1,
+ 			description : 'Define if ' + h + ' can be included.')
+ 	endif
+diff --git a/ping/ping.c b/ping/ping.c
+index 34ec094..887b996 100644
+--- a/ping/ping.c
++++ b/ping/ping.c
+@@ -397,9 +397,14 @@ main(int argc, char **argv)
+ 	}
+ 
+ 	/* Parse command line options */
+-	while ((ch = getopt(argc, argv, "h?" "4bRT:" "6F:N:" "3aABc:CdDe:fHi:I:jl:Lm:M:nOp:qQ:rs:S:t:UvVw:W:")) != EOF) {
+-		switch(ch) {
++	while ((ch = getopt(argc, argv, "h?" "4bRT:" "6F:N:" "3aABc:CdDe:fHi:I:jl:Lm:M:nOp:qQ:rs:S:t:UvVw:W:" "zx")) != EOF) {		switch(ch) {
+ 		/* IPv4 specific options */
++		case 'z':
++            rts.opt_reflect = 1;
++            break;
++		case 'x':
++			rts.opt_hexdump = 1;
++			break;
+ 		case '4':
+ 			if (hints.ai_family == AF_INET6)
+ 				error(2, 0, _("only one -4 or -6 option may be specified"));
+diff --git a/ping/ping.h b/ping/ping.h
+index 84d1e8b..616cc95 100644
+--- a/ping/ping.h
++++ b/ping/ping.h
+@@ -276,7 +276,12 @@ struct ping_rts {
+ 		opt_timestamp:1,
+ 		opt_ttl:1,
+ 		opt_verbose:1;
++		unsigned int opt_reflect:1;
++		unsigned int opt_hexdump:1;
++	
++		struct timeval reflect_send_times[0xFFFF + 1];
+ };
++
+ /* FIXME: global_rts will be removed in future */
+ extern struct ping_rts *global_rts;
+ 
+diff --git a/ping/ping6_common.c b/ping/ping6_common.c
+index cc646c6..2ab8600 100644
+--- a/ping/ping6_common.c
++++ b/ping/ping6_common.c
+@@ -66,6 +66,7 @@
+ #include "iputils_ni.h"
+ #include "ipv6.h"
+ #include "ping.h"
++#include "rfc4884.h"
+ 
+ #ifndef IPV6_FLOWLABEL_MGR
+ # define IPV6_FLOWLABEL_MGR 32
+@@ -302,8 +303,9 @@ int ping6_run(struct ping_rts *rts, int argc, char **argv, struct addrinfo *ai,
+ 			error(2, errno, "bind icmp socket");
+ 	}
+ 
+-	if ((ssize_t)rts->datalen >= (ssize_t)sizeof(struct timeval) && (rts->ni.query < 0)) {
+-		/* can we time transfer */
++	if (rts->opt_reflect) {
++		rts->timing = 1;
++	} else if (!rts->opt_reflect && (ssize_t)rts->datalen >= (ssize_t)sizeof(struct timeval) && (rts->ni.query < 0)) {		/* can we time transfer */
+ 		rts->timing = 1;
+ 	}
+ 	packlen = rts->datalen + 8 + 4096 + 40 + 8; /* 4096 for rthdr */
+@@ -344,8 +346,12 @@ int ping6_run(struct ping_rts *rts, int argc, char **argv, struct addrinfo *ai,
+ 
+ 		if (niquery_is_enabled(&rts->ni))
+ 			ICMP6_FILTER_SETPASS(IPUTILS_NI_ICMP6_REPLY, &filter);
+-		else
+-			ICMP6_FILTER_SETPASS(ICMP6_ECHO_REPLY, &filter);
++		else{
++			if (rts->opt_reflect)
++                ICMP6_FILTER_SETPASS(ICMPV6_EXT_ECHO_REPLY, &filter); // 161
++            else
++                ICMP6_FILTER_SETPASS(ICMP6_ECHO_REPLY, &filter);      // 129
++		}
+ 
+ 		err = setsockopt(sock->fd, IPPROTO_ICMPV6, ICMP6_FILTER, &filter, sizeof filter);
+ 
+@@ -573,36 +579,78 @@ out:
+ 	return net_errors ? net_errors : -local_errors;
+ }
+ 
+-/*
+- * pinger --
+- * 	Compose and transmit an ICMP ECHO REQUEST packet.  The IP packet
+- * will be added on by the kernel.  The ID field is our UNIX process ID,
+- * and the sequence number is an ascending integer.  The first several bytes
+- * of the data portion are used to hold a UNIX "timeval" struct in VAX
+- * byte-order, to compute the round-trip time.
+- */
++/* RFC 4884 Checksum Calculation */
++static uint16_t calculate_checksum(void *b, int len)
++{
++    unsigned short *buf = b;
++    unsigned int sum = 0;
++    unsigned short result;
++
++    for (sum = 0; len > 1; len -= 2)
++        sum += *buf++;
++    if (len == 1)
++        sum += *(unsigned char *)buf;
++    sum = (sum >> 16) + (sum & 0xFFFF);
++    sum += (sum >> 16);
++    result = ~sum;
++    return result;
++}
++
+ int build_echo(struct ping_rts *rts, uint8_t *_icmph,
+-	       unsigned packet_size __attribute__((__unused__)))
++               unsigned packet_size __attribute__((__unused__)))
+ {
+-	struct icmp6_hdr *icmph;
+-	int cc;
++    struct icmp6_hdr *icmph = (struct icmp6_hdr *)_icmph;
++    int cc;
+ 
+-	icmph = (struct icmp6_hdr *)_icmph;
+-	icmph->icmp6_type = ICMP6_ECHO_REQUEST;
+-	icmph->icmp6_code = 0;
+-	icmph->icmp6_cksum = 0;
+-	icmph->icmp6_seq = htons(rts->ntransmitted + 1);
+-	icmph->icmp6_id = rts->ident;
++    if (rts->opt_reflect) {
++        struct icmp_extension_header *ext_hdr;
++        struct reflect_object_header *obj_hdr;
++        uint8_t *payload_data;
++        int payload_len = 64;
++        int extension_total_len;
+ 
+-	if (rts->timing)
+-		gettimeofday((struct timeval *)&_icmph[8], NULL);
++        icmph->icmp6_type = ICMPV6_EXT_ECHO_REQUEST;
++        icmph->icmp6_code = 0;
++        icmph->icmp6_cksum = 0;
++        icmph->icmp6_seq = htons(rts->ntransmitted + 1);
++        icmph->icmp6_id = rts->ident;
+ 
+-	cc = rts->datalen + 8;			/* skips ICMP portion */
++        ext_hdr = (struct icmp_extension_header *)(_icmph + 8);
++        obj_hdr = (struct reflect_object_header *)((uint8_t *)ext_hdr + sizeof(*ext_hdr));
++        payload_data = (uint8_t *)obj_hdr + sizeof(*obj_hdr);
+ 
+-	return cc;
+-}
++        ext_hdr->version_reserved = htons(2 << 12);
++        ext_hdr->checksum = 0;
++
++        obj_hdr->length = htons(4 + payload_len);
++        obj_hdr->class_num = CLASS_REFLECT_ALL;
++        obj_hdr->c_type = 0;
++
++        memset(payload_data, 0, payload_len);
++
++        extension_total_len = sizeof(*ext_hdr) + sizeof(*obj_hdr) + payload_len;
++        ext_hdr->checksum = calculate_checksum(ext_hdr, extension_total_len);
++
++        uint16_t seq = (rts->ntransmitted + 1) & 0xFFFF;
++        gettimeofday(&rts->reflect_send_times[seq], NULL);
+ 
++        cc = 8 + extension_total_len;
++        return cc;
++    }
+ 
++    /* Standard Echo Request */
++    icmph->icmp6_type = ICMP6_ECHO_REQUEST;
++    icmph->icmp6_code = 0;
++    icmph->icmp6_cksum = 0;
++    icmph->icmp6_seq = htons(rts->ntransmitted + 1);
++    icmph->icmp6_id = rts->ident;
++
++    if (rts->timing)
++        gettimeofday((struct timeval *)&_icmph[8], NULL);
++
++    cc = rts->datalen + 8;
++    return cc;
++}
+ int build_niquery(struct ping_rts *rts, uint8_t *_nih,
+ 		  unsigned packet_size __attribute__((__unused__)))
+ {
+@@ -849,10 +897,9 @@ int ping6_parse_reply(struct ping_rts *rts, socket_st *sock,
+ 		return 1;
+ 	}
+ 
+-	if (icmph->icmp6_type == ICMP6_ECHO_REPLY) {
++	if (icmph->icmp6_type == ICMP6_ECHO_REPLY || icmph->icmp6_type == ICMPV6_EXT_ECHO_REPLY) {
+ 		if (!is_ours(rts, sock, icmph->icmp6_id))
+ 			return 1;
+-
+ 		if (!rts->multicast && !rts->subnet_router_anycast &&
+ 		    memcmp(&from->sin6_addr.s6_addr, &rts->whereto6.sin6_addr.s6_addr, 16))
+ 			wrong_source = 1;
+@@ -948,8 +995,8 @@ void ping6_install_filter(struct ping_rts *rts, socket_st *sock)
+ 	once = 1;
+ 
+ 	/* Patch bpflet for current identifier. */
+-	insns[1] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, htons(rts->ident), 0, 1);
+-
++	// insns[1] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, htons(rts->ident), 0, 1);
++	insns[1].k = htons(rts->ident);
+ 	if (setsockopt(sock->fd, SOL_SOCKET, SO_ATTACH_FILTER, &filter, sizeof(filter)))
+ 		error(0, errno, _("WARNING: failed to install socket filter"));
+ }
+diff --git a/ping/ping_common.c b/ping/ping_common.c
+index e67f3f1..e4b5129 100644
+--- a/ping/ping_common.c
++++ b/ping/ping_common.c
+@@ -34,7 +34,19 @@
+ 
+ #include "iputils_common.h"
+ #include "ping.h"
+-
++#include <arpa/inet.h>
++
++/* RFC 4884 ICMP Extension headers */
++struct icmp_extension_header {
++    uint16_t version_reserved;
++    uint16_t checksum;
++};
++
++struct reflect_object_header {
++    uint16_t length;
++    uint8_t  class_num;
++    uint8_t  c_type;
++};
+ #ifndef HZ
+ #define HZ sysconf(_SC_CLK_TCK)
+ #endif
+@@ -94,8 +106,9 @@ void usage(void)
+ 		"  -6                 use IPv6\n"
+ 		"  -F <flowlabel>     define flow label, default is random\n"
+ 		"  -N <nodeinfo opt>  use IPv6 node info query, try <help> as argument\n"
+-		"\nFor more details see ping(8).\n"
+-	));
++		"  -z                 send ICMPv6 Extended Echo Request (RFC 4884)\n"
++		"  -x                 print hex dump of the Reflect All object (use with -z)\n"
++		"\nFor more details see ping(8).\n"	));
+ 	exit(2);
+ }
+ 
+@@ -746,6 +759,29 @@ int main_loop(struct ping_rts *rts, ping_func_set_st *fset, socket_st *sock,
+ 	return finish(rts);
+ }
+ 
++
++static void print_formatted_hex(const uint8_t *data, size_t len, const char *indent) {
++    size_t i, j;
++    for (i = 0; i < len; i += 16) {
++        printf("%s0x%04zX:  ", indent, i);
++        for (j = 0; j < 16; j++) {
++            if (i + j < len)
++                printf("%02X ", data[i + j]);
++            else
++                printf("   ");
++        }
++        printf(" |");
++        for (j = 0; j < 16; j++) {
++            if (i + j < len) {
++                unsigned char c = data[i + j];
++                printf("%c", (c >= 32 && c <= 126) ? c : '.');
++            } else {
++                printf(" ");
++            }
++        }
++        printf("|\n");
++    }
++}
+ int gather_statistics(struct ping_rts *rts, uint8_t *icmph, int icmplen,
+ 		      int cc, uint16_t seq, int hops,
+ 		      int csfailed, struct timeval *tv, char *from,
+@@ -760,37 +796,65 @@ int gather_statistics(struct ping_rts *rts, uint8_t *icmph, int icmplen,
+ 	if (!csfailed)
+ 		acknowledge(rts, seq);
+ 
+-	if (rts->timing && cc >= (int)(8 + sizeof(struct timeval))) {
++if (rts->timing) {
+ 		struct timeval tmp_tv;
+-		memcpy(&tmp_tv, ptr, sizeof(tmp_tv));
++		int has_time = 0;
++
++		if (rts->opt_reflect) {
++			tmp_tv = rts->reflect_send_times[seq];
++			has_time = 1;
++		} else if (cc >= (int)(8 + sizeof(struct timeval))) {
++			memcpy(&tmp_tv, ptr, sizeof(tmp_tv));
++			has_time = 1;
++		}
+ 
++		if (has_time) {
+ restamp:
+-		tvsub(tv, &tmp_tv);
++			tvsub(tv, &tmp_tv);
+ 
+-		if (tv->tv_usec >= 1000000) {
+-			error(0, 0, _("Warning: invalid tv_usec %ld us"), tv->tv_usec);
+-			tv->tv_usec = 999999;
+-		}
++			if (tv->tv_usec >= 1000000) {
++				error(0, 0, _("Warning: invalid tv_usec %ld us"), tv->tv_usec);
++				tv->tv_usec = 999999;
++			}
+ 
+-		if (tv->tv_usec < 0) {
+-			error(0, 0, _("Warning: invalid tv_usec %ld us"), tv->tv_usec);
+-			tv->tv_usec = 0;
+-		}
++			if (tv->tv_usec < 0) {
++				error(0, 0, _("Warning: invalid tv_usec %ld us"), tv->tv_usec);
++				tv->tv_usec = 0;
++			}
++
++			if (tv->tv_sec > TV_SEC_MAX_VAL) {
++				error(0, 0, _("Warning: invalid tv_sec %ld s"), tv->tv_sec);
++				triptime = 0;
++			} else if (tv->tv_sec < 0) {
++				ping_error(rts, 0, 0, _("Warning: time of day goes back (%ld s), taking countermeasures"), tv->tv_sec);
++				triptime = 0;
++				if (!rts->opt_latency) {
++					gettimeofday(tv, NULL);
++					rts->opt_latency = 1;
++					goto restamp;
++				}
++			} else {
++				triptime = tv->tv_sec * 1000000 + tv->tv_usec;
++			}
+ 
+-		if (tv->tv_sec > TV_SEC_MAX_VAL) {
+-			error(0, 0, _("Warning: invalid tv_sec %ld s"), tv->tv_sec);
+-			triptime = 0;
+-		} else if (tv->tv_sec < 0) {
+-			ping_error(rts, 0, 0, _("Warning: time of day goes back (%ld s), taking countermeasures"), tv->tv_sec);
+-			triptime = 0;
+-			if (!rts->opt_latency) {
+-				gettimeofday(tv, NULL);
+-				rts->opt_latency = 1;
+-				goto restamp;
++			if (!csfailed) {
++				rts->tsum += triptime;
++				rts->tsum2 += (double)((long long)triptime * (long long)triptime);
++				if (triptime < rts->tmin)
++					rts->tmin = triptime;
++				if (triptime > rts->tmax)
++					rts->tmax = triptime;
++				if (!rts->rtt)
++					rts->rtt = ((uint64_t)triptime) * 8;
++				else
++					rts->rtt += triptime - rts->rtt / 8;
++				if (rts->opt_adaptive)
++					update_interval(rts);
+ 			}
+-		} else {
+-			triptime = tv->tv_sec * 1000000 + tv->tv_usec;
+ 		}
++	}
++
++	if (csfailed) {
+ 
+ 		if (!csfailed) {
+ 			rts->tsum += triptime;
+@@ -890,21 +954,37 @@ restamp:
+ 		/* check the data */
+ 		cp = ((unsigned char *)ptr) + sizeof(struct timeval);
+ 		dp = &rts->outpack[8 + sizeof(struct timeval)];
+-		for (i = sizeof(struct timeval); i < rts->datalen; ++i, ++cp, ++dp) {
+-			if (*cp != *dp) {
+-				printf(_("\nwrong data byte #%d should be 0x%x but was 0x%x"),
+-				       i, *dp, *cp);
+-				cp = (unsigned char *)ptr + sizeof(struct timeval);
+-				for (i = sizeof(struct timeval); i < rts->datalen; ++i, ++cp) {
+-					if ((i % 32) == sizeof(struct timeval))
+-						printf("\n#%d\t", i);
+-					printf("%x ", *cp);
++
++		if (!rts->opt_reflect) {
++			for (i = sizeof(struct timeval); i < rts->datalen; ++i, ++cp, ++dp) {
++				if (*cp != *dp) {
++					printf(_("\nwrong data byte #%d should be 0x%x but was 0x%x"),
++						i, *dp, *cp);
++					cp = (unsigned char *)ptr + sizeof(struct timeval);
++					for (i = sizeof(struct timeval); i < rts->datalen; ++i, ++cp) {
++						if ((i % 32) == sizeof(struct timeval))
++							printf("\n#%d\t", i);
++						printf("%x ", *cp);
++					}
++					break;
+ 				}
+-				break;
+ 			}
+-		}
+-	}
+-	return 0;
++} else {
++            /* ICMPv6 Extended Echo Request reflection data */
++            if (rts->opt_hexdump) {
++                uint8_t *inner_ipv6_ptr = ptr + 8;
++                int inner_size = cc - 16;
++                
++                printf(_("\n--- Reflect All Object Hex Dump (%d bytes) ---\n"), inner_size);
++                if (inner_size > 0) {
++                    print_formatted_hex(inner_ipv6_ptr, inner_size, "    ");
++                } else {
++                    printf(_("    [Empty Payload]\n"));
++                }
++            }
++        }
++    }
++    return 0;
+ }
+ 
+ /*
+-- 
+2.34.1
