@@ -1,0 +1,371 @@
+From 8d568659b44216f65ac4dc17985f3ec266eae330 Mon Sep 17 00:00:00 2001
+From: Shakked Zucker <shakkedz@campus.technion.ac.il>
+Date: Mon, 25 May 2026 11:11:49 +0300
+Subject: [PATCH] ping: add ICMPv6 reflection options
+
+Add -z to send an ICMPv6 Extended Echo Request containing a
+Reflect All object.
+
+Add -x to print the reflected payload returned in the Reflect All
+object as a hex dump. Store the send timestamp by sequence number so
+RTT calculation continues to work when the normal ping payload is used
+as a reflection placeholder.
+
+The new options are intended for IPv6 reflection diagnostics.
+
+Signed-off-by: Shakked Zucker <shakkedz@campus.technion.ac.il>
+---
+ ping/ping.c               |   8 ++-
+ ping/ping.h               |   6 ++-
+ ping/ping6_common.c       |  68 ++++++++++++++++++++++--
+ ping/ping_common.c        | 106 ++++++++++++++++++++++++++++++++------
+ ping/rfc4884_reflection.h |  31 +++++++++++
+ 5 files changed, 196 insertions(+), 23 deletions(-)
+ create mode 100644 ping/rfc4884_reflection.h
+
+diff --git a/ping/ping.c b/ping/ping.c
+index 34ec094..cfe3b80 100644
+--- a/ping/ping.c
++++ b/ping/ping.c
+@@ -397,8 +397,14 @@ main(int argc, char **argv)
+ 	}
+ 
+ 	/* Parse command line options */
+-	while ((ch = getopt(argc, argv, "h?" "4bRT:" "6F:N:" "3aABc:CdDe:fHi:I:jl:Lm:M:nOp:qQ:rs:S:t:UvVw:W:")) != EOF) {
++	while ((ch = getopt(argc, argv, "h?" "4bRT:" "6F:N:" "3aABc:CdDe:fHi:I:jl:Lm:M:nOp:qQ:rs:S:t:UvVw:W:" "zx")) != EOF) {
+ 		switch(ch) {
++		case 'z':
++			rts.opt_reflect = 1;
++			break;
++		case 'x':
++			rts.opt_hexdump = 1;
++			break;
+ 		/* IPv4 specific options */
+ 		case '4':
+ 			if (hints.ai_family == AF_INET6)
+diff --git a/ping/ping.h b/ping/ping.h
+index 84d1e8b..21b40d1 100644
+--- a/ping/ping.h
++++ b/ping/ping.h
+@@ -275,7 +275,11 @@ struct ping_rts {
+ 		opt_strictsource:1,
+ 		opt_timestamp:1,
+ 		opt_ttl:1,
+-		opt_verbose:1;
++		opt_verbose:1,
++		opt_reflect:1,
++		opt_hexdump:1;
++
++	struct timeval reflect_send_times[0x10000];
+ };
+ /* FIXME: global_rts will be removed in future */
+ extern struct ping_rts *global_rts;
+diff --git a/ping/ping6_common.c b/ping/ping6_common.c
+index cc646c6..0254f95 100644
+--- a/ping/ping6_common.c
++++ b/ping/ping6_common.c
+@@ -66,6 +66,7 @@
+ #include "iputils_ni.h"
+ #include "ipv6.h"
+ #include "ping.h"
++#include "rfc4884_reflection.h"
+ 
+ #ifndef IPV6_FLOWLABEL_MGR
+ # define IPV6_FLOWLABEL_MGR 32
+@@ -302,7 +303,9 @@ int ping6_run(struct ping_rts *rts, int argc, char **argv, struct addrinfo *ai,
+ 			error(2, errno, "bind icmp socket");
+ 	}
+ 
+-	if ((ssize_t)rts->datalen >= (ssize_t)sizeof(struct timeval) && (rts->ni.query < 0)) {
++	if (rts->opt_reflect) {
++		rts->timing = 1;
++	} else if ((ssize_t)rts->datalen >= (ssize_t)sizeof(struct timeval) && (rts->ni.query < 0)) {
+ 		/* can we time transfer */
+ 		rts->timing = 1;
+ 	}
+@@ -344,6 +347,8 @@ int ping6_run(struct ping_rts *rts, int argc, char **argv, struct addrinfo *ai,
+ 
+ 		if (niquery_is_enabled(&rts->ni))
+ 			ICMP6_FILTER_SETPASS(IPUTILS_NI_ICMP6_REPLY, &filter);
++		else if (rts->opt_reflect)
++			ICMP6_FILTER_SETPASS(ICMPV6_EXT_ECHO_REPLY, &filter);
+ 		else
+ 			ICMP6_FILTER_SETPASS(ICMP6_ECHO_REPLY, &filter);
+ 
+@@ -581,17 +586,69 @@ out:
+  * of the data portion are used to hold a UNIX "timeval" struct in VAX
+  * byte-order, to compute the round-trip time.
+  */
++static uint16_t rfc4884_checksum(const void *buf, size_t len)
++{
++	const uint16_t *words = buf;
++	uint32_t sum = 0;
++
++	while (len > 1) {
++		sum += *words++;
++		len -= 2;
++	}
++
++	if (len)
++		sum += *(const uint8_t *)words;
++
++	sum = (sum >> 16) + (sum & 0xffff);
++	sum += sum >> 16;
++
++	return ~sum;
++}
++
+ int build_echo(struct ping_rts *rts, uint8_t *_icmph,
+ 	       unsigned packet_size __attribute__((__unused__)))
+ {
+-	struct icmp6_hdr *icmph;
++	struct icmp6_hdr *icmph = (struct icmp6_hdr *)_icmph;
++	uint16_t seq = (rts->ntransmitted + 1) & 0xffff;
+ 	int cc;
+ 
+-	icmph = (struct icmp6_hdr *)_icmph;
++	if (rts->opt_reflect) {
++		struct icmp_ext_hdr_wire *ext_hdr;
++		struct icmp_ext_obj_hdr_wire *obj_hdr;
++		uint8_t *payload;
++		uint16_t payload_len = rts->datalen;
++		uint16_t obj_len = sizeof(*obj_hdr) + payload_len;
++		uint16_t ext_len = sizeof(*ext_hdr) + obj_len;
++
++		icmph->icmp6_type = ICMPV6_EXT_ECHO_REQUEST;
++		icmph->icmp6_code = 0;
++		icmph->icmp6_cksum = 0;
++		icmph->icmp6_seq = htons(seq);
++		icmph->icmp6_id = rts->ident;
++
++		ext_hdr = (struct icmp_ext_hdr_wire *)(_icmph + sizeof(*icmph));
++		obj_hdr = (struct icmp_ext_obj_hdr_wire *)(ext_hdr + 1);
++		payload = (uint8_t *)(obj_hdr + 1);
++
++		ext_hdr->version_reserved = htons(ICMP_EXT_HDR_VERSION << 12);
++		ext_hdr->checksum = 0;
++
++		obj_hdr->length = htons(obj_len);
++		obj_hdr->class_num = ICMP_EXT_OBJ_CLASS_REFLECT_ALL;
++		obj_hdr->c_type = ICMP_EXT_OBJ_CTYPE_REQUEST;
++
++		memset(payload, 0, payload_len);
++
++		ext_hdr->checksum = rfc4884_checksum(ext_hdr, ext_len);
++		gettimeofday(&rts->reflect_send_times[seq], NULL);
++
++		return sizeof(*icmph) + ext_len;
++	}
++
+ 	icmph->icmp6_type = ICMP6_ECHO_REQUEST;
+ 	icmph->icmp6_code = 0;
+ 	icmph->icmp6_cksum = 0;
+-	icmph->icmp6_seq = htons(rts->ntransmitted + 1);
++	icmph->icmp6_seq = htons(seq);
+ 	icmph->icmp6_id = rts->ident;
+ 
+ 	if (rts->timing)
+@@ -849,7 +906,8 @@ int ping6_parse_reply(struct ping_rts *rts, socket_st *sock,
+ 		return 1;
+ 	}
+ 
+-	if (icmph->icmp6_type == ICMP6_ECHO_REPLY) {
++	if (icmph->icmp6_type == ICMP6_ECHO_REPLY ||
++	    icmph->icmp6_type == ICMPV6_EXT_ECHO_REPLY) {
+ 		if (!is_ours(rts, sock, icmph->icmp6_id))
+ 			return 1;
+ 
+diff --git a/ping/ping_common.c b/ping/ping_common.c
+index e67f3f1..0ba15e8 100644
+--- a/ping/ping_common.c
++++ b/ping/ping_common.c
+@@ -34,6 +34,8 @@
+ 
+ #include "iputils_common.h"
+ #include "ping.h"
++#include "rfc4884_reflection.h"
++#include <arpa/inet.h>
+ 
+ #ifndef HZ
+ #define HZ sysconf(_SC_CLK_TCK)
+@@ -94,6 +96,8 @@ void usage(void)
+ 		"  -6                 use IPv6\n"
+ 		"  -F <flowlabel>     define flow label, default is random\n"
+ 		"  -N <nodeinfo opt>  use IPv6 node info query, try <help> as argument\n"
++		"  -z                 send ICMPv6 Extended Echo Request with Reflect All\n"
++		"  -x                 print reflected payload as hex, use with -z\n"
+ 		"\nFor more details see ping(8).\n"
+ 	));
+ 	exit(2);
+@@ -746,6 +750,67 @@ int main_loop(struct ping_rts *rts, ping_func_set_st *fset, socket_st *sock,
+ 	return finish(rts);
+ }
+ 
++static void print_reflection_hex(const uint8_t *data, size_t len)
++{
++	size_t i;
++	size_t j;
++
++	for (i = 0; i < len; i += 16) {
++		printf("    0x%04zX:  ", i);
++
++		for (j = 0; j < 16; j++) {
++			if (i + j < len)
++				printf("%02X ", data[i + j]);
++			else
++				printf("   ");
++		}
++
++		printf(" |");
++		for (j = 0; j < 16; j++) {
++			if (i + j < len) {
++				unsigned char c = data[i + j];
++
++				printf("%c", (c >= 32 && c <= 126) ? c : '.');
++			} else {
++				printf(" ");
++			}
++		}
++		printf("|\n");
++	}
++}
++
++static void print_reflection_payload(uint8_t *ptr, int cc, int icmplen)
++{
++	struct icmp_ext_hdr_wire *ext_hdr;
++	struct icmp_ext_obj_hdr_wire *obj_hdr;
++	uint8_t *payload;
++	int remaining;
++	int obj_len;
++	int payload_len;
++	int min_len = icmplen + sizeof(*ext_hdr) + sizeof(*obj_hdr);
++
++	if (cc < min_len) {
++		printf("\n--- Reflect All Object Hex Dump unavailable ---\n");
++		return;
++	}
++
++	ext_hdr = (struct icmp_ext_hdr_wire *)ptr;
++	obj_hdr = (struct icmp_ext_obj_hdr_wire *)(ext_hdr + 1);
++	obj_len = ntohs(obj_hdr->length);
++	remaining = cc - icmplen - sizeof(*ext_hdr);
++
++	if (obj_len < (int)sizeof(*obj_hdr) || obj_len > remaining) {
++		printf("\n--- Reflect All Object Hex Dump malformed ---\n");
++		return;
++	}
++
++	payload = (uint8_t *)(obj_hdr + 1);
++	payload_len = obj_len - sizeof(*obj_hdr);
++
++	printf("\n--- Reflect All Object Hex Dump (%d bytes) ---\n", payload_len);
++	print_reflection_hex(payload, payload_len);
++}
++
+ int gather_statistics(struct ping_rts *rts, uint8_t *icmph, int icmplen,
+ 		      int cc, uint16_t seq, int hops,
+ 		      int csfailed, struct timeval *tv, char *from,
+@@ -760,9 +825,14 @@ int gather_statistics(struct ping_rts *rts, uint8_t *icmph, int icmplen,
+ 	if (!csfailed)
+ 		acknowledge(rts, seq);
+ 
+-	if (rts->timing && cc >= (int)(8 + sizeof(struct timeval))) {
++	if (rts->timing &&
++	    (rts->opt_reflect || cc >= (int)(8 + sizeof(struct timeval)))) {
+ 		struct timeval tmp_tv;
+-		memcpy(&tmp_tv, ptr, sizeof(tmp_tv));
++
++		if (rts->opt_reflect)
++			tmp_tv = rts->reflect_send_times[seq];
++		else
++			memcpy(&tmp_tv, ptr, sizeof(tmp_tv));
+ 
+ restamp:
+ 		tvsub(tv, &tmp_tv);
+@@ -847,7 +917,7 @@ restamp:
+ 		if (hops >= 0)
+ 			ping_print_int(rts, _(" ttl=%d"), "ttl", hops);
+ 
+-		if (cc < rts->datalen + 8) {
++		if (!rts->opt_reflect && cc < rts->datalen + 8) {
+ 			ping_print_truncated(rts);
+ 			return 1;
+ 		}
+@@ -887,20 +957,24 @@ restamp:
+ 		if (wrong_source)
+ 			printf(_(" (DIFFERENT ADDRESS!)"));
+ 
+-		/* check the data */
+-		cp = ((unsigned char *)ptr) + sizeof(struct timeval);
+-		dp = &rts->outpack[8 + sizeof(struct timeval)];
+-		for (i = sizeof(struct timeval); i < rts->datalen; ++i, ++cp, ++dp) {
+-			if (*cp != *dp) {
+-				printf(_("\nwrong data byte #%d should be 0x%x but was 0x%x"),
+-				       i, *dp, *cp);
+-				cp = (unsigned char *)ptr + sizeof(struct timeval);
+-				for (i = sizeof(struct timeval); i < rts->datalen; ++i, ++cp) {
+-					if ((i % 32) == sizeof(struct timeval))
+-						printf("\n#%d\t", i);
+-					printf("%x ", *cp);
++		if (rts->opt_reflect && rts->opt_hexdump) {
++			print_reflection_payload(ptr, cc, icmplen);
++		} else if (!rts->opt_reflect) {
++			/* check the data */
++			cp = ((unsigned char *)ptr) + sizeof(struct timeval);
++			dp = &rts->outpack[8 + sizeof(struct timeval)];
++			for (i = sizeof(struct timeval); i < rts->datalen; ++i, ++cp, ++dp) {
++				if (*cp != *dp) {
++					printf(_("\nwrong data byte #%d should be 0x%x but was 0x%x"),
++					       i, *dp, *cp);
++					cp = (unsigned char *)ptr + sizeof(struct timeval);
++					for (i = sizeof(struct timeval); i < rts->datalen; ++i, ++cp) {
++						if ((i % 32) == sizeof(struct timeval))
++							printf("\n#%d\t", i);
++						printf("%x ", *cp);
++					}
++					break;
+ 				}
+-				break;
+ 			}
+ 		}
+ 	}
+diff --git a/ping/rfc4884_reflection.h b/ping/rfc4884_reflection.h
+new file mode 100644
+index 0000000..7fc4b5c
+--- /dev/null
++++ b/ping/rfc4884_reflection.h
+@@ -0,0 +1,31 @@
++#ifndef IPUTILS_RFC4884_REFLECTION_H
++#define IPUTILS_RFC4884_REFLECTION_H
++
++#include <stdint.h>
++
++#ifndef ICMPV6_EXT_ECHO_REQUEST
++#define ICMPV6_EXT_ECHO_REQUEST 160
++#endif
++
++#ifndef ICMPV6_EXT_ECHO_REPLY
++#define ICMPV6_EXT_ECHO_REPLY 161
++#endif
++
++#define ICMP_EXT_HDR_VERSION			2
++#define ICMP_EXT_OBJ_CLASS_REFLECT_ALL		6
++#define ICMP_EXT_OBJ_CTYPE_REQUEST		0
++#define ICMP_EXT_OBJ_CTYPE_REPLY_NO_ERROR	1
++#define ICMP_EXT_OBJ_CTYPE_REPLY_UNSUPPORTED	2
++
++struct icmp_ext_hdr_wire {
++	uint16_t version_reserved;
++	uint16_t checksum;
++};
++
++struct icmp_ext_obj_hdr_wire {
++	uint16_t length;
++	uint8_t class_num;
++	uint8_t c_type;
++};
++
++#endif
+-- 
+2.34.1
+

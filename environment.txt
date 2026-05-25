@@ -1,0 +1,9 @@
+Kernel:
+6.8.12-reflect-clean+
+
+Probe sysctl:
+net.ipv4.icmp_echo_enable_probe = 1
+
+Ping binary:
+ping from iputils 20250605-35-g7042a23
+libcap: yes, IDN: yes, NLS: yes, error.h: yes, getrandom(): yes, __fpending(): yes
