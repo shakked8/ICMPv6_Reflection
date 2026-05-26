@@ -5,11 +5,11 @@ ICMPv6 Extended Echo Request/Reply and a Reflect All object.
 
 ## Files
 
-- 0001-icmpv6-add-reflect-all-support.patch
+- icmpv6-add-reflect-all-support.patch
   Linux kernel patch. Adds Reflect All object constants and handling in the
   ICMPv6 Extended Echo reply path.
 
-- 0001-ping-add-icmpv6-reflection-options.patch
+- ping-add-icmpv6-reflection-options.patch
   iputils patch. Adds ping -z to send an ICMPv6 Extended Echo Request with a
   Reflect All object, and ping -x to print the reflected payload as a hex dump.
 
