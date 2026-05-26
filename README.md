@@ -45,6 +45,19 @@ Expected result:
 - RTT is printed
 - Reflect All Object hex dump is printed
 
+## Wireshark Lua dissector
+
+The `wireshark/icmpv6_reflection.lua` file contains a Wireshark Lua dissector/helper for inspecting the ICMPv6 Reflection packets used in this prototype.
+
+It helps inspect:
+
+- ICMPv6 Extended Echo Request, type 160
+- ICMPv6 Extended Echo Reply, type 161
+- ICMP Extension Header
+- Reflect All object header
+- Reflected IPv6 packet payload
+
+
 ## Notes
 
 IPv6 does not use the term TTL. The equivalent field is Hop Limit.
