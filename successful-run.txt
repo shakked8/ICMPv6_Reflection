@@ -1,12 +1,12 @@
 PING ::1 (::1) 56 data bytes
-72 bytes from ::1: icmp_seq=1 ttl=64 time=0.326 ms
+72 bytes from ::1: icmp_seq=5 ttl=64 time=0.000 ms
 --- Reflect All Object Hex Dump (56 bytes) ---
-    0x0000:  60 0D DF 37 00 48 3A 40 00 00 00 00 00 00 00 00  |`..7.H:@........|
+    0x0000:  60 0A A4 3E 00 48 3A 40 00 00 00 00 00 00 00 00  |`..>.H:@........|
     0x0010:  00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 00  |................|
-    0x0020:  00 00 00 00 00 00 00 01 A0 00 5F 76 00 04 00 01  |.........._v....|
+    0x0020:  00 00 00 00 00 00 00 01 A0 00 5F 74 00 06 00 01  |.........._t....|
     0x0030:  20 00 D9 C3 00 3C 06 00                          | ....<..        |
 
 
 --- ::1 ping statistics ---
 1 packets transmitted, 1 received, 0% packet loss, time 0ms
-rtt min/avg/max/mdev = 0.326/0.326/0.326/0.000 ms
+rtt min/avg/max/mdev = 0.000/0.000/0.000/0.000 ms
