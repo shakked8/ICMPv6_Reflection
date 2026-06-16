@@ -1,12 +1,44 @@
-PING ::1 (::1) 56 data bytes
-72 bytes from ::1: icmp_seq=5 ttl=64 time=0.000 ms
---- Reflect All Object Hex Dump (56 bytes) ---
-    0x0000:  60 0A A4 3E 00 48 3A 40 00 00 00 00 00 00 00 00  |`..>.H:@........|
-    0x0010:  00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 00  |................|
-    0x0020:  00 00 00 00 00 00 00 01 A0 00 5F 74 00 06 00 01  |.........._t....|
-    0x0030:  20 00 D9 C3 00 3C 06 00                          | ....<..        |
+Kernel version used for the final tests:
+6.8.12-reflect-clean+
 
+Positive test command:
+sudo ./build/ping/ping -6 -z -x -Z 100 ::1 -c 1
 
---- ::1 ping statistics ---
-1 packets transmitted, 1 received, 0% packet loss, time 0ms
-rtt min/avg/max/mdev = 0.000/0.000/0.000/0.000 ms
+Positive test result:
+- The command sent an ICMPv6 Extended Echo Request with a Reflect All object.
+- The CLI flag -Z 100 set the Reflect All object payload length to 100 bytes.
+- The Reflect All object total length was 104 bytes:
+  4-byte Reflect All object header + 100-byte reflected payload.
+- ping printed:
+  116 bytes from ::1: icmp_seq=1 ttl=64
+  --- Reflect All Object Hex Dump (100 bytes) ---
+
+Positive tcpdump evidence:
+- Request contains: 0068 0600
+  Meaning: Object Length 104, Class 6, C-Type Request.
+- Reply contains: 0068 0601
+  Meaning: Object Length 104, Class 6, C-Type Reply - No Error.
+- Reply contains flags word 0105.
+  Meaning: Sequence 1, Active flag set, IPv6 flag set.
+- tcpdump reports [icmp6 sum ok] for both request and reply.
+
+Negative checksum test:
+A malformed ICMPv6 Extended Echo Request was sent with:
+- valid outer ICMPv6 checksum;
+- invalid ICMP Extension checksum: 0x1234;
+- Reflect All object header: 0068 0600.
+
+Negative checksum test result:
+- tcpdump captured only one ICMPv6 packet during a 20-second capture window.
+- The captured packet was type 160, the malformed Extended Echo Request.
+- No type 161 Extended Echo Reply was captured.
+- This confirms that the kernel drops Extended Echo Requests with an invalid ICMP Extension checksum.
+
+Additional CLI validation:
+- Running without -z:
+  ./build/ping/ping -6 -Z 100 ::1 -c 1
+  correctly fails with: -Z requires -z
+
+- Running with an oversized reflection length:
+  ./build/ping/ping -6 -z -Z 2000 ::1 -c 1
+  correctly fails with: out of range: 0 <= value <= 1224
