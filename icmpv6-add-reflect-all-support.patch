@@ -1,4 +1,4 @@
-From 97f1f478c90a8d6ff9185452e28260a98dc640ec Mon Sep 17 00:00:00 2001
+From af04ec327ca3f6dac9ca886ee583b41e1654d3c1 Mon Sep 17 00:00:00 2001
 From: Shakked Zucker <shakkedz@campus.technion.ac.il>
 Date: Mon, 25 May 2026 10:18:46 +0300
 Subject: [PATCH] icmpv6: add Reflect All support for Extended Echo
@@ -17,8 +17,8 @@ values.
 Signed-off-by: Shakked Zucker <shakkedz@campus.technion.ac.il>
 ---
  include/uapi/linux/icmpv6.h |  10 ++++
- net/ipv6/icmp.c             | 105 +++++++++++++++++++++++++++++++++---
- 2 files changed, 109 insertions(+), 6 deletions(-)
+ net/ipv6/icmp.c             | 102 +++++++++++++++++++++++++++++++++++-
+ 2 files changed, 110 insertions(+), 2 deletions(-)
 
 diff --git a/include/uapi/linux/icmpv6.h b/include/uapi/linux/icmpv6.h
 index ecaece3..d2842cd 100644
@@ -41,7 +41,7 @@ index ecaece3..d2842cd 100644
  
  #endif /* _UAPI_LINUX_ICMPV6_H */
 diff --git a/net/ipv6/icmp.c b/net/ipv6/icmp.c
-index 1635da0..f3ea842 100644
+index 1635da0..3205116 100644
 --- a/net/ipv6/icmp.c
 +++ b/net/ipv6/icmp.c
 @@ -69,6 +69,16 @@
@@ -61,7 +61,7 @@ index 1635da0..f3ea842 100644
  static DEFINE_PER_CPU(struct sock *, ipv6_icmp_sk);
  
  static int icmpv6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
-@@ -722,10 +732,13 @@ static enum skb_drop_reason icmpv6_echo_reply(struct sk_buff *skb)
+@@ -722,9 +732,11 @@ static enum skb_drop_reason icmpv6_echo_reply(struct sk_buff *skb)
  	struct icmpv6_msg msg;
  	struct dst_entry *dst;
  	struct ipcm6_cookie ipc6;
@@ -71,11 +71,9 @@ index 1635da0..f3ea842 100644
  	bool acast;
 +	bool reflect_all = false;
  	u8 type;
-+	unsigned int reply_len;
  
  	if (ipv6_addr_is_multicast(&ipv6_hdr(skb)->daddr) &&
- 	    net->ipv6.sysctl.icmpv6_echo_ignore_multicast)
-@@ -796,21 +809,101 @@ static enum skb_drop_reason icmpv6_echo_reply(struct sk_buff *skb)
+@@ -796,10 +808,92 @@ static enum skb_drop_reason icmpv6_echo_reply(struct sk_buff *skb)
  	ipc6.tclass = ipv6_get_dsfield(ipv6_hdr(skb));
  	ipc6.sockc.mark = mark;
  
@@ -89,35 +87,41 @@ index 1635da0..f3ea842 100644
 +		unsigned int obj_len;
 +		unsigned int ext_len;
 +
-+		if (!pskb_may_pull(skb, min_len))
- 			goto out_dst_release;
- 
-+		icmph = icmp6_hdr(skb);
-+		ext_hdr = (struct icmp_ext_hdr *)(icmph + 1);
-+		obj_hdr = (struct icmp_ext_obj_hdr *)(ext_hdr + 1);
-+		obj_len = ntohs(obj_hdr->length);
-+		ext_len = sizeof(*ext_hdr) + obj_len;
-+
-+		if (ext_hdr->version == 2 &&
-+		    obj_hdr->class_num == ICMP_EXT_OBJ_CLASS_REFLECT_ALL) {
-+			if (obj_hdr->c_type != ICMP_EXT_OBJ_CTYPE_REQUEST ||
-+			    obj_len < sizeof(*obj_hdr))
-+				goto out_dst_release;
-+
-+			if (!pskb_may_pull(skb, ext_len))
-+				goto out_dst_release;
-+
++		if (pskb_may_pull(skb, min_len)) {
 +			icmph = icmp6_hdr(skb);
 +			ext_hdr = (struct icmp_ext_hdr *)(icmph + 1);
 +			obj_hdr = (struct icmp_ext_obj_hdr *)(ext_hdr + 1);
 +
-+			if (!icmp_ext_checksum_valid(ext_hdr, ext_len))
-+				goto out_dst_release;
++			if (ext_hdr->version == 2 &&
++			    obj_hdr->class_num ==
++				    ICMP_EXT_OBJ_CLASS_REFLECT_ALL) {
++				obj_len = ntohs(obj_hdr->length);
++				ext_len = sizeof(*ext_hdr) + obj_len;
 +
-+			reflect_all = true;
-+		} else if (!icmp_build_probe(skb, (struct icmphdr *)&tmp_hdr)) {
-+			goto out_dst_release;
++				if (obj_hdr->c_type !=
++					    ICMP_EXT_OBJ_CTYPE_REQUEST ||
++				    obj_len < sizeof(*obj_hdr))
++					goto out_dst_release;
++
++				if (!pskb_may_pull(skb, ext_len))
++					goto out_dst_release;
++
++				icmph = icmp6_hdr(skb);
++				ext_hdr =
++					(struct icmp_ext_hdr *)(icmph + 1);
++				obj_hdr =
++					(struct icmp_ext_obj_hdr *)(ext_hdr + 1);
++
++				if (!icmp_ext_checksum_valid(ext_hdr, ext_len))
++					goto out_dst_release;
++
++				reflect_all = true;
++			}
 +		}
++
++		if (!reflect_all &&
++		    !icmp_build_probe(skb, (struct icmphdr *)&tmp_hdr))
++			goto out_dst_release;
 +	}
 +
 +	if (reflect_all) {
@@ -132,8 +136,8 @@ index 1635da0..f3ea842 100644
 +
 +		reflect_skb = skb_copy(skb, GFP_ATOMIC);
 +		if (!reflect_skb)
-+			goto out_dst_release;
-+
+ 			goto out_dst_release;
+ 
 +		reply_icmph = icmp6_hdr(reflect_skb);
 +		reply_ext_hdr = (struct icmp_ext_hdr *)(reply_icmph + 1);
 +		reply_obj_hdr = (struct icmp_ext_obj_hdr *)(reply_ext_hdr + 1);
@@ -161,19 +165,11 @@ index 1635da0..f3ea842 100644
 +		msg.skb = reflect_skb;
 +	}
 +
-+	reply_len = msg.skb->len + sizeof(struct icmp6hdr);
-+
  	if (ip6_append_data(sk, icmpv6_getfrag, &msg,
--			    skb->len + sizeof(struct icmp6hdr),
--			    sizeof(struct icmp6hdr), &ipc6, &fl6,
-+			    reply_len, sizeof(struct icmp6hdr), &ipc6, &fl6,
- 			    (struct rt6_info *)dst, MSG_DONTWAIT)) {
- 		__ICMP6_INC_STATS(net, idev, ICMP6_MIB_OUTERRORS);
- 		ip6_flush_pending_frames(sk);
- 	} else {
--		icmpv6_push_pending_frames(sk, &fl6, &tmp_hdr,
--					   skb->len + sizeof(struct icmp6hdr));
-+		icmpv6_push_pending_frames(sk, &fl6, &tmp_hdr, reply_len);
+ 			    skb->len + sizeof(struct icmp6hdr),
+ 			    sizeof(struct icmp6hdr), &ipc6, &fl6,
+@@ -811,6 +905,10 @@ static enum skb_drop_reason icmpv6_echo_reply(struct sk_buff *skb)
+ 					   skb->len + sizeof(struct icmp6hdr));
  		reason = SKB_CONSUMED;
  	}
 +
